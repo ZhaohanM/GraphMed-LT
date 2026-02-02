@@ -1,0 +1,3 @@
+mykey = {
+    "TriMediQ": "your password",
+}
