@@ -5,16 +5,15 @@ from sentence_transformers import SentenceTransformer, util
 
 # from mydifflib import get_close_matches
 
-device = torch.device("cuda")
-# device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() and torch.backends.mps.is_built() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 
-emb_model = SentenceTransformer('stsb-roberta-large', device=device)
+emb_model = SentenceTransformer('stsb-roberta-large', device=str(device))
 
 def eval_sample(id, sample, choice, scores, questions, answers, answer_dne, temp_choice_list, threshold=0.85):
     questions_emb = emb_model.encode(questions, device=device)
     facts_emb = emb_model.encode(sample["facts"], device=device)
-    facts_count = [0]*len(sample["facts"], device=device)
+    facts_count = [0] * len(sample["facts"])
     answers_expanded, answers_count = [], []
     
     for answer in answers:

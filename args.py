@@ -37,22 +37,35 @@ def get_args():
     parser.add_argument('--top_p', type=float, default=0.9, help='Top p value for nucleus sampling.')
     parser.add_argument('--max_tokens', type=int, default=256, help='Maximum number of tokens to generate.')
     parser.add_argument('--top_logprobs', type=int, default=0, help='Number of top logprobs to return.')
-    parser.add_argument('--api_account', type=str, default="mediQ", help='API keys are stored in keys.py, api_account is the name of the key.')
-    parser.add_argument("--projection_ckpt", type=str, default="proj_ce_only.ckpt",
-                        help="Path to projector/GNN/mappers checkpoint saved by projection_train.py")
+    parser.add_argument('--api_account', type=str, default="GraphMed-LT", help='API keys are stored in keys.py, api_account is the name of the key.')
+    parser.add_argument("--projection_ckpt", type=str, default="save_model/graphmed_lt.ckpt",
+                        help="Path to graph encoder/projector/mappers checkpoint saved by projection_train.py")
     parser.add_argument("--prefix_len", type=int, default=20,
-                        help="Soft-prefix length used by the projector")
-    parser.add_argument("--gnn_in_dim", type=int, default=768,
+                        help="Number of graph-conditioned evidence tokens")
+    parser.add_argument("--refinement_steps", type=int, default=5,
+                        help="Latent clinical thought refinement steps")
+    parser.add_argument("--gnn_in_dim", type=int, default=256,
                         help="GNN input dim (should match training)")
-    parser.add_argument("--gnn_hidden_dim", type=int, default=768,
+    parser.add_argument("--gnn_hidden_dim", type=int, default=256,
                         help="GNN hidden/output dim (should match training)")
+    parser.add_argument("--gnn_model", type=str, default="gat", choices=["gcn", "gat", "gt"],
+                        help="Graph encoder architecture")
+    parser.add_argument("--gnn_layers", type=int, default=2)
+    parser.add_argument("--gat_heads", type=int, default=4)
     parser.add_argument("--triplet_model", type=str, default="llama-3.3-70b-instruct-awq",
                         help="Model used for triplet extraction (can be API or local)")
+    parser.add_argument("--triplet_corpus", type=str, default=None,
+                        help="Local external triplet corpus, e.g. a PrimeKG-derived triplet file")
+    parser.add_argument("--retrieval_top_k", type=int, default=3,
+                        help="Number of retrieved external triplets per turn")
+    parser.add_argument("--max_corpus_triplets", type=int, default=None,
+                        help="Optional cap for loading a large triplet corpus during debugging")
     
     args =  parser.parse_args()
 
-    if args.log_filename: os.makedirs(os.path.dirname(args.log_filename), exist_ok=True)
-    if args.history_log_filename: os.makedirs(os.path.dirname(args.history_log_filename), exist_ok=True)
-    if args.detail_log_filename: os.makedirs(os.path.dirname(args.detail_log_filename), exist_ok=True)
-    if args.message_log_filename: os.makedirs(os.path.dirname(args.message_log_filename), exist_ok=True)
+    for path in [args.log_filename, args.history_log_filename, args.detail_log_filename, args.message_log_filename]:
+        if path:
+            directory = os.path.dirname(path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
     return args

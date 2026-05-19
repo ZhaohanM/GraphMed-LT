@@ -14,14 +14,16 @@ from patient import Patient
 from utils.triplet_projector import TripletProjector
 from utils.gnn import load_gnn_model
 from utils.triplets_to_graph import init_sbert, make_text_mappers, triplets_to_graph
+from utils.graph_memory import PatientGraphMemory
+from utils.triplet_retrieval import TripletRetriever
 
 # === your triplet extractor ===
 import triplet_extraction
 
 from openai import OpenAI
 client = OpenAI(
-    base_url="http://api.llm.apps.os.dcs.gla.ac.uk/v1",
-    api_key=os.environ["IDA_LLM_API_KEY"]
+    base_url=os.environ.get("IDA_LLM_BASE_URL", "http://api.llm.apps.os.dcs.gla.ac.uk/v1"),
+    api_key=os.environ.get("IDA_LLM_API_KEY", "YOUR_API_KEY_HERE")
 )
 
 def setup_logger(name: str, file: Optional[str]):
@@ -58,83 +60,79 @@ def load_data(filename: str) -> Dict[str, Dict[str, Any]]:
 class TripletProjectionEngine:
     """
     Loads the trained projection checkpoint (projector + GNN + text mappers),
-    and provides a method to turn a list of triplets into a soft-prefix embedding.
-
-    It does NOT apply the prefix to any LLM here; instead, it returns the prefix tensor.
-    Your expert module can read `patient_state["triplet_prefix"]` and inject it into
-    the model call (e.g., by concatenating with token embeddings before forward).
+    and provides a method to turn patient-specific graph memory into
+    graph-conditioned evidence tokens.
     """
     def __init__(
         self,
         ckpt_path: str,
-        gnn_in_dim: int = 768,
-        gnn_hidden_dim: int = 768,
+        gnn_in_dim: int = 256,
+        gnn_hidden_dim: int = 256,
         prefix_len: int = 20,
         device: Optional[torch.device] = None,
     ):
         self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
         self.ckpt_path = ckpt_path
-        self.gnn_in_dim = gnn_in_dim
-        self.gnn_hidden_dim = gnn_hidden_dim
-        self.prefix_len = prefix_len
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Projection checkpoint not found at: {ckpt_path}")
+        self.state = torch.load(ckpt_path, map_location=self.device)
+        cfg = self.state.get("config", {})
+        self.gnn_in_dim = int(cfg.get("gnn_in_dim", gnn_in_dim))
+        self.gnn_hidden_dim = int(cfg.get("gnn_hidden_dim", gnn_hidden_dim))
+        self.prefix_len = int(cfg.get("prefix_len", prefix_len))
+        self.hidden_size = int(self.state.get("hidden_size", cfg.get("hidden_size", self.gnn_hidden_dim)))
+        self.gnn_model = cfg.get("gnn_model", "gat")
+        self.gnn_layers = int(cfg.get("gnn_layers", 2))
+        self.gat_heads = int(cfg.get("gat_heads", 4))
 
         # SBERT encoder (frozen) and text mappers (trainable; weights will be loaded)
         self.sbert_model, self.sbert_tokenizer, self.sbert_device, self.sbert_dim = init_sbert()
         # mappers map SBERT embeddings to GNN input dim
-        self.node_in, self.edge_in = make_text_mappers(
+        self.node_in, self.edge_in, self.source_in = make_text_mappers(
             sbert_dim=self.sbert_dim,
             gnn_in_dim=self.gnn_in_dim,
             device=self.device,
+            include_source=True,
         )
 
-        # GNN encoder (trainable)
-        self.graph_encoder = load_gnn_model["gcn"](
+        self.graph_encoder = load_gnn_model[self.gnn_model](
             in_channels=self.gnn_in_dim,
             hidden_channels=self.gnn_hidden_dim,
             out_channels=self.gnn_hidden_dim,
-            num_layers=2,
+            num_layers=self.gnn_layers,
             dropout=0.1,
+            num_heads=self.gat_heads,
         ).to(self.device)
 
-        # Projector: (graph → prefix)
         self.projector = TripletProjector(
             graph_encoder=self.graph_encoder,
             gnn_hidden_dim=self.gnn_hidden_dim,
             prefix_len=self.prefix_len,
-            # NOTE: hidden_size of expert model is not strictly needed to *compute* the prefix;
-            # but the projector was trained with a particular hidden size. We keep its learned
-            # output layer as saved in the checkpoint.
-            hidden_size=self.gnn_hidden_dim  # dummy placeholder; overwritten by state_dict
+            hidden_size=self.hidden_size,
         ).to(self.device)
 
-        self._load_ckpt(ckpt_path)
+        self._load_ckpt()
         self.projector.eval()
         self.graph_encoder.eval()
         self.node_in.eval()
         self.edge_in.eval()
+        self.source_in.eval()
 
-    def _load_ckpt(self, path: str):
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Projection checkpoint not found at: {path}")
-        state = torch.load(path, map_location=self.device)
-        # expected keys: projector, graph_encoder, node_in, edge_in
-        self.projector.load_state_dict(state["projector"])
-        self.graph_encoder.load_state_dict(state["graph_encoder"])
-        self.node_in.load_state_dict(state["node_in"])
-        self.edge_in.load_state_dict(state["edge_in"])
-
-        # optionally read config:
-        cfg = state.get("config", {})
-        # sanity log (does not hard-fail if mismatch; you may enforce if desired)
-        logging.info(f"[ProjectionEngine] Loaded ckpt from {path} with config: {cfg}")
+    def _load_ckpt(self):
+        self.projector.load_state_dict(self.state["projector"])
+        self.graph_encoder.load_state_dict(self.state["graph_encoder"])
+        self.node_in.load_state_dict(self.state["node_in"])
+        self.edge_in.load_state_dict(self.state["edge_in"])
+        if "source_in" in self.state:
+            self.source_in.load_state_dict(self.state["source_in"])
+        logging.info(f"[ProjectionEngine] Loaded ckpt from {self.ckpt_path} with config: {self.state.get('config', {})}")
 
     @torch.no_grad()
     def triplets_to_prefix(self, triplets: List[Tuple[str, str, str]]) -> torch.Tensor:
         """
-        Converts triplets → PyG graph → projector → (1, prefix_len, hidden) tensor (device-local).
+        Converts triplets → PyG graph → evidence tokens with shape (1, m, hidden).
         """
         if not triplets:
-            # Return an empty prefix to signal "no soft prompt"
             return torch.empty(0, device=self.device)
 
         graph_data = triplets_to_graph(
@@ -144,10 +142,11 @@ class TripletProjectionEngine:
             sbert_device=self.sbert_device,
             node_in=self.node_in,
             edge_in=self.edge_in,
+            source_in=self.source_in,
             gnn_in_dim=self.gnn_in_dim,
             device=self.device,
         )
-        prefix_emb = self.projector(graph_data)  # (1, prefix_len, hidden)
+        prefix_emb = self.projector(graph_data)  # (1, m, hidden)
         return prefix_emb
 
 def main():
@@ -175,12 +174,10 @@ def main():
     patient_module = importlib.import_module(_args.patient_module)
     patient_class = getattr(patient_module, _args.patient_class)
 
-    # === NEW: Build projection engine and load projection.ckpt ===
+    # Build graph evidence engine and load graphmed_lt.ckpt.
     projection_ckpt = getattr(_args, "projection_ckpt", None) or getattr(_args, "proj_ckpt", None)
-    if not projection_ckpt:
-        # sensible default name consistent with training snippet
-        projection_ckpt = getattr(_args, "save_ckpt", "proj_ce_only.ckpt")
-    # Allow turning off projection by setting projection_ckpt="" in args
+    if projection_ckpt in ("", "none", "None"):
+        projection_ckpt = None
     projection_engine = None
     if projection_ckpt:
         projection_engine = TripletProjectionEngine(
@@ -191,7 +188,28 @@ def main():
         )
         print(f"[INFO] Loaded projection checkpoint from: {projection_ckpt}")
     else:
-        print("[INFO] No projection checkpoint provided; running without soft-prefix projection.")
+        print("[INFO] No projection checkpoint provided; running without graph evidence tokens.")
+
+    retriever = None
+    if getattr(_args, "triplet_corpus", None):
+        device = projection_engine.device if projection_engine is not None else (
+            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        )
+        if projection_engine is not None:
+            sbert_model = projection_engine.sbert_model
+            sbert_tokenizer = projection_engine.sbert_tokenizer
+            sbert_device = projection_engine.sbert_device
+        else:
+            sbert_model, sbert_tokenizer, sbert_device, _ = init_sbert()
+        retriever = TripletRetriever(
+            _args.triplet_corpus,
+            sbert_model=sbert_model,
+            sbert_tokenizer=sbert_tokenizer,
+            sbert_device=sbert_device,
+            device=device,
+            max_triplets=getattr(_args, "max_corpus_triplets", None),
+        )
+        print(f"[INFO] Loaded {len(retriever.records)} external triplets from: {_args.triplet_corpus}")
 
     # Iterate patients
     num_processed = 0
@@ -211,7 +229,8 @@ def main():
             patient_class,
             sample,
             args=_args,
-            projection_engine=projection_engine
+            projection_engine=projection_engine,
+            retriever=retriever,
         )
 
         log_info(f"|||||||||||||||||||| Interaction ended for patient #{pid} ||||||||||||||||||||\n\n\n")
@@ -268,19 +287,22 @@ def run_patient_interaction(
     patient_class,
     sample: Dict[str, Any],
     args,
-    projection_engine: Optional[TripletProjectionEngine] = None
+    projection_engine: Optional[TripletProjectionEngine] = None,
+    retriever: Optional[TripletRetriever] = None,
 ):
     """
     Multi-turn conversation loop. Each turn we extract / update triplets and,
-    if a projection_engine is provided, compute a soft-prefix embedding from these triplets.
-    The soft prefix is attached to patient_state["triplet_prefix"] for the expert to use.
+    if a projection_engine is provided, compute graph-conditioned evidence tokens
+    from the source-aware graph memory. The tensor is attached to
+    patient_state["triplet_prefix"] for local expert implementations that can
+    consume embedding-level context.
     """
     # 0) Build Expert & Patient
     expert_system = expert_class(args, sample["question"], sample["options"])
     patient_system = patient_class(args, sample)
 
     qa_pairs: List[Tuple[str, str]] = []
-    all_triplets: List[Tuple[str, str, str]] = []
+    graph_memory = PatientGraphMemory()
 
     temp_choice_list: List[str] = []
     temp_additional_info: List[Dict[str, Any]] = []
@@ -296,6 +318,7 @@ def run_patient_interaction(
         "temperature": getattr(args, "temperature", 0.2),
         "max_tokens": getattr(args, "max_tokens", 512),
         "top_p": getattr(args, "top_p", 0.95),
+        "client": client,
         "debug": False
     }
 
@@ -306,14 +329,19 @@ def run_patient_interaction(
         choices=sample["options"],
         model_args=triplet_model_args
     )
-    all_triplets.extend(init_triplets)
+    retrieved_triplets = retriever.retrieve(
+        initial_patient_info,
+        top_k=getattr(args, "retrieval_top_k", 3),
+    ) if retriever is not None else []
+    graph_memory.initialise(init_triplets)
+    graph_memory.update([], retrieved_triplets)
 
-    # seed patient_state with triplets and an optional soft prefix
+    # Seed patient_state with graph memory and optional evidence tokens.
     patient_state = patient_system.get_state()
-    patient_state["triplets"] = all_triplets
+    patient_state["triplets"] = graph_memory.records
     if projection_engine is not None:
-        prefix = projection_engine.triplets_to_prefix(all_triplets)
-        patient_state["triplet_prefix"] = prefix  # (1, prefix_len, hidden) or empty tensor
+        prefix = projection_engine.triplets_to_prefix(graph_memory.records)
+        patient_state["triplet_prefix"] = prefix  # (1, m, hidden) or empty tensor
 
     # 2) Turns
     while len(patient_system.get_questions()) < args.max_questions:
@@ -340,22 +368,22 @@ def run_patient_interaction(
                 question=question_str,
                 qa_pairs=[(doctor_q, patient_response)],
                 model_args=triplet_model_args,
-                existing_triplets=all_triplets,
+                existing_triplets=graph_memory.as_text_list(include_source=False),
                 choices=sample["options"]
             )
 
-            # Update triplets with de-duplication (preserve order)
-            if new_qa_triplets:
-                for t in new_qa_triplets:
-                    if t not in all_triplets:
-                        all_triplets.append(t)
+            retrieved_triplets = retriever.retrieve(
+                patient_response,
+                top_k=getattr(args, "retrieval_top_k", 3),
+            ) if retriever is not None else []
+            graph_memory.update(new_qa_triplets, retrieved_triplets)
 
             # Update patient_state
             patient_state = patient_system.get_state()
-            patient_state["triplets"] = all_triplets
+            patient_state["triplets"] = graph_memory.records
 
             if projection_engine is not None:
-                prefix = projection_engine.triplets_to_prefix(all_triplets)
+                prefix = projection_engine.triplets_to_prefix(graph_memory.records)
                 patient_state["triplet_prefix"] = prefix
 
         elif response_dict["type"] == "choice":
@@ -371,7 +399,7 @@ def run_patient_interaction(
                 "options": sample["options"],
                 "context": sample.get("context", ""),
                 "facts": getattr(patient_system, "facts", None),
-                "triplets": all_triplets
+                "triplets": graph_memory.records
             }
             return (
                 expert_decision,
@@ -389,9 +417,9 @@ def run_patient_interaction(
     log_info(f"==================== Max Interaction Length ({args.max_questions} turns) Reached "
              f"--> Force Final Answer ====================")
     patient_state = patient_system.get_state()
-    patient_state["triplets"] = all_triplets
+    patient_state["triplets"] = graph_memory.records
     if projection_engine is not None:
-        patient_state["triplet_prefix"] = projection_engine.triplets_to_prefix(all_triplets)
+        patient_state["triplet_prefix"] = projection_engine.triplets_to_prefix(graph_memory.records)
 
     response_dict = expert_system.respond(patient_state)
     log_info(f"[Expert System]: {response_dict}")
@@ -407,7 +435,7 @@ def run_patient_interaction(
         "options": sample["options"],
         "context": sample.get("context", ""),
         "facts": getattr(patient_system, "facts", None),
-        "triplets": all_triplets
+        "triplets": graph_memory.records
     }
 
     return (

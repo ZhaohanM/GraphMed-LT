@@ -25,7 +25,8 @@ class GCN(torch.nn.Module):
     def forward(self, x, adj_t, edge_attr):
         for i, conv in enumerate(self.convs[:-1]):
             x = conv(x, adj_t)
-            x = self.bns[i](x)
+            if x.size(0) > 1:
+                x = self.bns[i](x)
             x = F.relu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
         x = self.convs[-1](x, adj_t)
@@ -54,23 +55,25 @@ class GraphTransformer(torch.nn.Module):
     def forward(self, x, adj_t, edge_attr):
         for i, conv in enumerate(self.convs[:-1]):
             x = conv(x, edge_index=adj_t, edge_attr=edge_attr)
-            x = self.bns[i](x)
+            if x.size(0) > 1:
+                x = self.bns[i](x)
             x = F.relu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
         x = self.convs[-1](x, edge_index=adj_t, edge_attr=edge_attr)
         return x, edge_attr
 
 class GAT(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, num_layers, dropout, num_heads=4):
+    def __init__(self, in_channels, hidden_channels, out_channels, num_layers, dropout, num_heads=4, edge_dim=None):
         super(GAT, self).__init__()
+        edge_dim = edge_dim or in_channels
         self.convs = torch.nn.ModuleList()
-        self.convs.append(GATConv(in_channels, hidden_channels, heads=num_heads, concat=False))
+        self.convs.append(GATConv(in_channels, hidden_channels, heads=num_heads, concat=False, edge_dim=edge_dim))
         self.bns = torch.nn.ModuleList()
         self.bns.append(torch.nn.BatchNorm1d(hidden_channels))
         for _ in range(num_layers - 2):
-            self.convs.append(GATConv(hidden_channels, hidden_channels, heads=num_heads, concat=False))
+            self.convs.append(GATConv(hidden_channels, hidden_channels, heads=num_heads, concat=False, edge_dim=edge_dim))
             self.bns.append(torch.nn.BatchNorm1d(hidden_channels))
-        self.convs.append(GATConv(hidden_channels, out_channels, heads=num_heads, concat=False))
+        self.convs.append(GATConv(hidden_channels, out_channels, heads=num_heads, concat=False, edge_dim=edge_dim))
         self.dropout = dropout
 
     def reset_parameters(self):
@@ -80,9 +83,11 @@ class GAT(torch.nn.Module):
             bn.reset_parameters()
 
     def forward(self, x, edge_index, edge_attr):
+        edge_attr = edge_attr if edge_attr is not None and edge_attr.numel() > 0 else None
         for i, conv in enumerate(self.convs[:-1]):
             x = conv(x, edge_index=edge_index, edge_attr=edge_attr)
-            x = self.bns[i](x)
+            if x.size(0) > 1:
+                x = self.bns[i](x)
             x = F.relu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
         x = self.convs[-1](x,edge_index=edge_index, edge_attr=edge_attr)

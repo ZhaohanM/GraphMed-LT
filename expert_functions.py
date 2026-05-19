@@ -1,6 +1,7 @@
 import prompts
 import expert_basics
 import logging
+from utils.graph_memory import triplet_to_text
 
 PROB_THRESHOLD = 0.8
 SCALE_THRESHOLD = 4.0
@@ -24,7 +25,7 @@ def answer_to_idx(answer):  # 'A'→0
 
 def build_triplet_context(patient_state):
     triplets = patient_state.get("triplets", [])
-    return "None" if not triplets else "\n".join(triplets)
+    return "None" if not triplets else "\n".join(triplet_to_text(t, include_source=True) for t in triplets)
 # -----------------------------------------------------------------
 
 

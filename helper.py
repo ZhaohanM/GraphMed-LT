@@ -138,10 +138,10 @@ class ModelCache:
                 top_logprobs=self.top_logprobs
             )
 
-        num_input_tokens = response["usage"]["prompt_tokens"]
-        num_output_tokens = response["usage"]["completion_tokens"]
-        response_text = response.choices[0].text.strip()
-        log_probs = response.choices[0].logprobs.top_logprobs if self.top_logprobs > 0 else None
+        num_input_tokens = response.usage.prompt_tokens
+        num_output_tokens = response.usage.completion_tokens
+        response_text = response.choices[0].message.content.strip()
+        log_probs = response.choices[0].logprobs if self.top_logprobs > 0 else None
         log_info(f"[{self.model_name}][OUTPUT]: {response}")
         return response_text, log_probs, {"input_tokens": num_input_tokens, "output_tokens": num_output_tokens}
 

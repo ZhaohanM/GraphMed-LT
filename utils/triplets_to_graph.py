@@ -1,10 +1,11 @@
 from __future__ import annotations
-from typing import List, Tuple, Dict, Optional, Union
+from typing import List, Tuple, Optional, Union
 
 import torch
 import torch.nn as nn
 from torch_geometric.data import Data
 from utils.lm_modeling import load_model, load_text2embedding
+from utils.graph_memory import PATIENT_SOURCE, normalize_triplet_record
 
 
 # -------------------------------
@@ -42,7 +43,8 @@ def make_text_mappers(
     sbert_dim: int,
     gnn_in_dim: int,
     device: Optional[Union[str, torch.device]] = None,
-) -> tuple[nn.Linear, nn.Linear]:
+    include_source: bool = False,
+):
     """
     Create trainable linear maps to project SBERT embeddings into the GNN input space.
     Returns:
@@ -52,6 +54,9 @@ def make_text_mappers(
     dev = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     node_in = nn.Linear(sbert_dim, gnn_in_dim, bias=False).to(dev)
     edge_in = nn.Linear(sbert_dim, gnn_in_dim, bias=False).to(dev)
+    if include_source:
+        source_in = nn.Embedding(2, gnn_in_dim).to(dev)
+        return node_in, edge_in, source_in
     return node_in, edge_in
 
 
@@ -59,45 +64,44 @@ def make_text_mappers(
 # Triplets → PyG graph (Data)
 # -----------------------------
 def _parse_triplets(
-    triplets: List[Union[str, Tuple[str, str, str]]]
-) -> tuple[List[str], List[Tuple[int, int]], List[str]]:
+    triplets: List[Union[str, Tuple[str, str, str], Tuple[str, str, str, str], dict]]
+) -> tuple[List[str], List[Tuple[int, int]], List[str], List[str]]:
     """
     Normalise triplets to nodes/edges/rels.
     Supports:
         • List[Tuple[head, rel, tail]]
-        • List[str] where each is "head; relation; tail"
+        • List[Tuple[head, rel, tail, source]]
+        • List[dict] with head/relation/tail/source fields
+        • List[str] where each is "(head | relation | tail)" or "head; relation; tail"
     Returns:
-        nodes: List[str], edges: List[(int,int)], rels: List[str]
+        nodes: List[str], edges: List[(int,int)], rels: List[str], sources: List[str]
     """
-    node2id: Dict[str, int] = {}
+    node2id: dict[str, int] = {}
     edges: List[Tuple[int, int]] = []
     rels: List[str] = []
+    sources: List[str] = []
 
     for t in triplets:
-        if isinstance(t, (list, tuple)) and len(t) == 3:
-            h, r, o = (str(t[0]).strip(), str(t[1]).strip(), str(t[2]).strip())
-        elif isinstance(t, str) and ";" in t:
-            parts = [p.strip() for p in t.split(";")]
-            if len(parts) < 3:
-                continue
-            h, r, o = parts[0], parts[1], parts[2]
-        else:
+        record = normalize_triplet_record(t, default_source=PATIENT_SOURCE)
+        if record is None:
             continue
+        h, r, o = record["head"], record["relation"], record["tail"]
 
         for n in (h, o):
             if n not in node2id:
                 node2id[n] = len(node2id)
         edges.append((node2id[h], node2id[o]))
         rels.append(r)
+        sources.append(record.get("source", PATIENT_SOURCE))
 
     nodes: List[str] = [None] * len(node2id)  # type: ignore[assignment]
     for n, i in node2id.items():
         nodes[i] = n
-    return nodes, edges, rels
+    return nodes, edges, rels, sources
 
 
 def triplets_to_graph(
-    triplets: List[Union[str, Tuple[str, str, str]]],
+    triplets: List[Union[str, Tuple[str, str, str], Tuple[str, str, str, str], dict]],
     *,
     sbert_model,
     sbert_tokenizer,
@@ -105,6 +109,7 @@ def triplets_to_graph(
     node_in: nn.Linear,
     edge_in: nn.Linear,
     gnn_in_dim: int,
+    source_in: Optional[nn.Embedding] = None,
     device: Optional[Union[str, torch.device]] = None,
 ) -> Data:
     """
@@ -126,7 +131,7 @@ def triplets_to_graph(
     """
     dev = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    nodes, edges, rels = _parse_triplets(triplets)
+    nodes, edges, rels, sources = _parse_triplets(triplets)
 
     if len(nodes) == 0:
         x = torch.zeros(1, gnn_in_dim, device=dev)
@@ -141,8 +146,16 @@ def triplets_to_graph(
     x = node_in(node_vecs.to(node_in.weight.device)).to(dev)  # (N, gnn_in_dim)
     e = edge_in(rel_vecs.to(edge_in.weight.device)).to(dev)   # (E, gnn_in_dim)
 
+    source_ids = torch.tensor(
+        [0 if source == PATIENT_SOURCE else 1 for source in sources],
+        dtype=torch.long,
+        device=dev,
+    )
+    if source_in is not None and source_ids.numel() > 0:
+        e = e + source_in(source_ids.to(source_in.weight.device)).to(dev)
+
     edge_index = torch.tensor(edges, dtype=torch.long, device=dev).t().contiguous()
-    return Data(x=x, edge_index=edge_index, edge_attr=e, num_nodes=x.shape[0])
+    return Data(x=x, edge_index=edge_index, edge_attr=e, source_type=source_ids, num_nodes=x.shape[0])
 
 
 __all__ = [

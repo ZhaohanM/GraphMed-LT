@@ -1,3 +1,3 @@
 mykey = {
-    "TriMediQ": "your password",
+    "GraphMed-LT": "your password",
 }
