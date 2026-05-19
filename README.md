@@ -28,8 +28,8 @@ The main training entry point is `projection_train.py`.
 ```bash
 python projection_train.py \
   --train_file data/all_train_convo.jsonl \
-  --expert_model meta-llama/Llama-3.1-8B-Instruct \
-  --triplet_model llama-3.3-70b-instruct-awq \
+  --expert_model Qwen/Qwen2.5-72B-Instruct \
+  --triplet_model Qwen/Qwen2.5-72B-Instruct \
   --triplet_corpus path/to/primekg_triplets.jsonl \
   --retrieval_top_k 3 \
   --prefix_len 20 \

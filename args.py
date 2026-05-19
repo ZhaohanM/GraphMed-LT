@@ -1,16 +1,16 @@
 import argparse
 import os
-# meta-llama/Llama-3.1-8B-Instruct
+# Qwen/Qwen2.5-72B-Instruct
 def get_args():
     parser = argparse.ArgumentParser(description="Run the benchmark with specified configurations.")
     parser.add_argument('--expert_module', type=str, default='expert', help='file name where the expert class is implemented.')
     parser.add_argument('--expert_class', type=str, required=True, help='Expert class name to use for the benchmark.')
-    parser.add_argument('--expert_model', type=str, default='meta-llama/Llama-3.1-8B-Instruct', help='Expert model name to use for the benchmark, can be a local model or a Huggingface model.')
-    parser.add_argument('--expert_model_question_generator', type=str, default='meta-llama/Llama-3.1-8B-Instruct', help='You can set a separate model for the follow-up question generator, can be a local model or a Huggingface model.')
+    parser.add_argument('--expert_model', type=str, default='Qwen/Qwen2.5-72B-Instruct', help='Expert model name to use for the benchmark, can be a local model or a Huggingface model.')
+    parser.add_argument('--expert_model_question_generator', type=str, default='Qwen/Qwen2.5-72B-Instruct', help='You can set a separate model for the follow-up question generator, can be a local model or a Huggingface model.')
     
     parser.add_argument('--patient_module', type=str, default='patient', help='file name where the patient class is implemented.')
     parser.add_argument('--patient_class', type=str, required=True, help='Patient class name to use for the benchmark.')
-    parser.add_argument('--patient_model', type=str, default='meta-llama/Llama-3.1-8B-Instruct', help='Patient model name to use for the benchmark, can be a local model or a Huggingface model.')
+    parser.add_argument('--patient_model', type=str, default='Qwen/Qwen2.5-72B-Instruct', help='Patient model name to use for the benchmark, can be a local model or a Huggingface model.')
     
     parser.add_argument('--data_dir', type=str, required=True, help='Directory containing the development data files.')
     parser.add_argument('--dev_filename', type=str, required=True, help='Filename for development data.')
@@ -52,7 +52,7 @@ def get_args():
                         help="Graph encoder architecture")
     parser.add_argument("--gnn_layers", type=int, default=2)
     parser.add_argument("--gat_heads", type=int, default=4)
-    parser.add_argument("--triplet_model", type=str, default="llama-3.3-70b-instruct-awq",
+    parser.add_argument("--triplet_model", type=str, default="Qwen/Qwen2.5-72B-Instruct",
                         help="Model used for triplet extraction (can be API or local)")
     parser.add_argument("--triplet_corpus", type=str, default=None,
                         help="Local external triplet corpus, e.g. a PrimeKG-derived triplet file")

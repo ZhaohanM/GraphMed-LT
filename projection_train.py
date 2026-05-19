@@ -152,8 +152,8 @@ def retrieve_knowledge_triplets(retriever: TripletRetriever | None, query: str, 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_file", default="data/all_train_convo.jsonl")
-    parser.add_argument("--expert_model", default="meta-llama/Llama-3.1-8B-Instruct")
-    parser.add_argument("--triplet_model", default="llama-3.3-70b-instruct-awq")
+    parser.add_argument("--expert_model", default="Qwen/Qwen2.5-72B-Instruct")
+    parser.add_argument("--triplet_model", default="Qwen/Qwen2.5-72B-Instruct")
 
     parser.add_argument("--prefix_len", type=int, default=20)
     parser.add_argument("--refinement_steps", type=int, default=5)

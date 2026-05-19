@@ -1,5 +1,4 @@
 #!/bin/bash
-#SBATCH -A brics.u6dr
 #SBATCH -p workq
 #SBATCH -N 2
 #SBATCH --gres=gpu:4
