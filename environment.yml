@@ -207,6 +207,7 @@ dependencies:
       - fastapi==0.115.7
       - filelock==3.17.0
       - gguf==0.10.0
+      - gensim
       - google-api-core==2.24.0
       - google-auth==2.38.0
       - googleapis-common-protos==1.66.0
@@ -255,6 +256,7 @@ dependencies:
       - rpds-py==0.22.3
       - rsa==4.9
       - sentencepiece==0.2.0
+      - sentence-transformers
       - smart-open==7.1.0
       - starlette==0.45.3
       - sympy==1.13.1
@@ -264,6 +266,7 @@ dependencies:
       - uvloop==0.21.0
       - virtualenv==20.29.1
       - vllm==0.6.6.post1
+      - wandb
       - watchfiles==1.0.4
       - websockets==14.2
       - wrapt==1.17.2

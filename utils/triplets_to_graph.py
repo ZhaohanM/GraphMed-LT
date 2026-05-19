@@ -130,6 +130,9 @@ def triplets_to_graph(
             edge_attr: (num_edges, gnn_in_dim)
     """
     dev = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    node_module = getattr(node_in, "module", node_in)
+    edge_module = getattr(edge_in, "module", edge_in)
+    source_module = getattr(source_in, "module", source_in) if source_in is not None else None
 
     nodes, edges, rels, sources = _parse_triplets(triplets)
 
@@ -143,16 +146,16 @@ def triplets_to_graph(
         node_vecs = sber_text2embedding(sbert_model, sbert_tokenizer, sbert_device, nodes)  # (N, sbert_dim) on CPU
         rel_vecs  = sber_text2embedding(sbert_model, sbert_tokenizer, sbert_device, rels)   # (E, sbert_dim) on CPU
 
-    x = node_in(node_vecs.to(node_in.weight.device)).to(dev)  # (N, gnn_in_dim)
-    e = edge_in(rel_vecs.to(edge_in.weight.device)).to(dev)   # (E, gnn_in_dim)
+    x = node_in(node_vecs.to(node_module.weight.device)).to(dev)  # (N, gnn_in_dim)
+    e = edge_in(rel_vecs.to(edge_module.weight.device)).to(dev)   # (E, gnn_in_dim)
 
     source_ids = torch.tensor(
         [0 if source == PATIENT_SOURCE else 1 for source in sources],
         dtype=torch.long,
         device=dev,
     )
-    if source_in is not None and source_ids.numel() > 0:
-        e = e + source_in(source_ids.to(source_in.weight.device)).to(dev)
+    if source_in is not None and source_module is not None and source_ids.numel() > 0:
+        e = e + source_in(source_ids.to(source_module.weight.device)).to(dev)
 
     edge_index = torch.tensor(edges, dtype=torch.long, device=dev).t().contiguous()
     return Data(x=x, edge_index=edge_index, edge_attr=e, source_type=source_ids, num_nodes=x.shape[0])

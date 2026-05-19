@@ -4,22 +4,15 @@
 
 ## Overview
 
-GraphMed-LT implements the system described in the paper. It converts patient responses into patient-specific clinical triplets, optionally retrieves relevant external knowledge triplets from a local PrimeKG-derived corpus, builds a source-aware patient graph memory, projects the graph into evidence tokens, and refines those tokens inside a trainable doctor agent through latent clinical thought refinement.
+We propose GraphMed-LT, a patient-specific graph memory approach with latent clinical thought refinement for multi-turn medical conversations. GraphMed-LT extracts patient-specific clinical triplets from patient responses, retrieves relevant knowledge triplets, and organises them into an incrementally updated graph memory. The graph memory is projected into graph-conditioned evidence tokens and refined inside a trainable doctor agent through hidden-state feedback, enabling the agent to update its internal clinical context before asking follow-up questions or producing the final answer.
 
 <p align="center">
   <img src="image/GraphMed-LT.png">
 </p>
 
-## Components
+## Method
 
-- **Patient agent**: frozen simulator that answers follow-up questions using only dataset-supported patient facts.
-- **Triplet agent**: frozen extractor that creates observed patient triplets from the initial patient description and later patient responses.
-- **External triplet retrieval**: optional top-3 retrieval from a local triplet corpus. In the paper this corpus is PrimeKG; this repository expects you to provide the local PrimeKG-derived triplet file through `--triplet_corpus`.
-- **Patient-specific graph memory**: initializes `G_0` from the initial patient description `p_0`, then updates the graph after each patient response.
-- **Source-aware graph encoder**: distinguishes patient-observed triplets from retrieved background triplets through source-type embeddings.
-- **Graph-to-token projector**: maps the graph representation into `m=20` graph-conditioned evidence tokens.
-- **Latent clinical thought refinement**: pairs each evidence token with a latent thought token and updates the thought tokens for `K=5` refinement steps inside the doctor agent.
-- **Doctor agent**: trained with full fine-tuning together with the graph encoder and projector. The patient and triplet agents remain frozen.
+GraphMed-LT consists of a patient agent, a triplet agent, a patient-specific graph memory module, and a trainable doctor agent. The patient agent returns responses grounded in the complete patient record. The triplet agent extracts patient-specific triplets from patient responses and retrieves the top-3 relevant knowledge triplets from an external triplet corpus. The graph memory is initialised as `G_0` using triplets extracted from the initial patient description `p_0` and is updated across turns by adding clinical entities and relation-labelled edges. Source-aware edge types distinguish patient-observed triplets from retrieved background knowledge. The graph memory is encoded with a GAT, projected into graph-conditioned evidence tokens, and integrated into the doctor agent through latent clinical thought refinement.
 
 ## Installation
 
@@ -30,7 +23,7 @@ conda activate GraphMed-LT
 
 ## Training
 
-The main training entry point is `projection_train.py`. Despite the historical filename, it now trains the graph encoder, graph-to-token projector, source-aware edge embeddings, latent refinement path, and doctor-agent parameters.
+The main training entry point is `projection_train.py`.
 
 ```bash
 python projection_train.py \
@@ -46,11 +39,18 @@ python projection_train.py \
   --gnn_hidden_dim 256 \
   --gat_heads 4 \
   --lr 1e-5 \
-  --batch_size 128 \
-  --epochs 50
+  --weight_decay 0.01 \
+  --batch_size 64 \
+  --epochs 5
 ```
 
-If `--triplet_corpus` is omitted, no retrieved background triplets are added. The code does not fabricate PrimeKG triples.
+The code expects the external triplet corpus to be provided locally and does not include PrimeKG triples in this repository.
+
+For multi-GPU or multi-node training on a Slurm cluster:
+
+```bash
+sbatch -N 2 scripts/isambard/submit_projection_train_ddp.slurm
+```
 
 ## Benchmark
 
@@ -64,8 +64,6 @@ python GraphMedLT_benchmark.py \
   --output_filename results/graphmed_lt_dev.jsonl \
   --max_questions 10
 ```
-
-The existing prompt-based expert classes keep a text fallback for API models. Embedding-level graph evidence and latent refinement are used directly in local training; API-only models cannot consume hidden-state evidence tokens.
 
 ## License
 

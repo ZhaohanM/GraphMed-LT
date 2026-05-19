@@ -1,3 +1,3 @@
 mykey = {
-    "GraphMed-LT": "your password",
+    "GraphMed-LT": "YOUR_API_KEY",
 }

@@ -5,8 +5,11 @@ import logging
 import torch
 import argparse
 import os
+import math
 from typing import List, Dict
 from tqdm import tqdm
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from utils.triplet_projector import TripletProjector
 from utils.latent_refinement import LatentClinicalThoughtRefiner
@@ -21,10 +24,90 @@ import wandb
 from openai import OpenAI
 
 
-client = OpenAI(
-    base_url=os.environ.get("IDA_LLM_BASE_URL", "http://api.llm.apps.os.dcs.gla.ac.uk/v1"),
-    api_key=os.environ.get("IDA_LLM_API_KEY", "YOUR_API_KEY_HERE")
-)
+client_kwargs = {"api_key": os.environ.get("OPENAI_API_KEY", "")}
+if os.environ.get("OPENAI_BASE_URL"):
+    client_kwargs["base_url"] = os.environ["OPENAI_BASE_URL"]
+client = OpenAI(**client_kwargs)
+
+
+def setup_distributed():
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = world_size > 1
+
+    if distributed:
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            backend = "nccl"
+        else:
+            backend = "gloo"
+        dist.init_process_group(backend=backend)
+
+    return distributed, rank, world_size, local_rank
+
+
+def is_main_process(rank: int) -> bool:
+    return rank == 0
+
+
+def unwrap_model(module):
+    return module.module if isinstance(module, DDP) else module
+
+
+class DoctorAgentWrapper(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self,
+        *,
+        inputs_embeds=None,
+        input_ids=None,
+        refined_context=None,
+        attention_mask=None,
+        **kwargs,
+    ):
+        if refined_context is not None:
+            if input_ids is None:
+                raise ValueError("input_ids are required when refined_context is provided.")
+            prompt_embeds = self.model.get_input_embeddings()(input_ids)
+            inputs_embeds = torch.cat([refined_context, prompt_embeds], dim=1)
+        return self.model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **kwargs)
+
+
+def build_epoch_shard(samples: List[Dict], epoch: int, rank: int, world_size: int, seed: int) -> List[Dict]:
+    epoch_samples = list(samples)
+    random.Random(seed + epoch).shuffle(epoch_samples)
+
+    if world_size == 1:
+        return epoch_samples
+
+    per_rank = math.ceil(len(epoch_samples) / world_size)
+    target_len = per_rank * world_size
+    if len(epoch_samples) < target_len:
+        epoch_samples.extend(epoch_samples[: target_len - len(epoch_samples)])
+    return epoch_samples[rank:target_len:world_size]
+
+
+def cleanup_distributed(distributed: bool):
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
+
+
+def sync_module_grads(modules, distributed: bool, world_size: int):
+    if not distributed:
+        return
+    for module in modules:
+        for param in module.parameters():
+            if not param.requires_grad:
+                continue
+            if param.grad is None:
+                param.grad = torch.zeros_like(param)
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+            param.grad.div_(world_size)
 
 
 def load_jsonl(path: str) -> List[Dict]:
@@ -74,13 +157,15 @@ def main():
 
     parser.add_argument("--prefix_len", type=int, default=20)
     parser.add_argument("--refinement_steps", type=int, default=5)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--save_ckpt", default="save_model/graphmed_lt.ckpt")
     parser.add_argument("--save_doctor_dir", default="save_model/doctor_agent")
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--debug", action="store_true", help="print extracted triplets for inspection")
+    parser.add_argument("--seed", type=int, default=42)
 
     # GNN dimensions
     parser.add_argument("--gnn_model", default="gat", choices=sorted(load_gnn_model))
@@ -94,23 +179,44 @@ def main():
     parser.add_argument("--gradient_checkpointing", action="store_true")
 
     args = parser.parse_args()
+    distributed, rank, world_size, local_rank = setup_distributed()
+    random.seed(args.seed + rank)
+    torch.manual_seed(args.seed + rank)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed + rank)
 
-    if args.use_wandb:
+    local_accum_steps = max(1, math.ceil(args.batch_size / world_size))
+    effective_batch_size = local_accum_steps * world_size
+
+    if args.use_wandb and is_main_process(rank):
         wandb.init(project="Train_GraphMed_LT", name="full_finetune_latent_refinement", config=vars(args))
 
     samples = load_jsonl(args.train_file)
-    logging.info(f"Loaded {len(samples)} samples from {args.train_file}")
+    if is_main_process(rank):
+        logging.info(f"Loaded {len(samples)} samples from {args.train_file}")
+        logging.info(
+            f"Distributed={distributed} world_size={world_size} "
+            f"local_accum_steps={local_accum_steps} effective_batch_size={effective_batch_size}"
+        )
 
     # ----- Doctor LLM (full fine-tuning) -----
     cache = helper.ModelCache(args.expert_model, max_tokens=512)
     tokenizer = cache.tokenizer
-    train_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = cache.model.to(train_device).train()
-    device = next(model.parameters()).device
-    if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
-    for p in model.parameters():
+    train_device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    raw_doctor_model = cache.model.to(train_device).train()
+    device = next(raw_doctor_model.parameters()).device
+    if args.gradient_checkpointing and hasattr(raw_doctor_model, "gradient_checkpointing_enable"):
+        raw_doctor_model.gradient_checkpointing_enable()
+    for p in raw_doctor_model.parameters():
         p.requires_grad_(True)
+    doctor_model = DoctorAgentWrapper(raw_doctor_model)
+    if distributed:
+        doctor_model = DDP(
+            doctor_model,
+            device_ids=[local_rank] if torch.cuda.is_available() else None,
+            output_device=local_rank if torch.cuda.is_available() else None,
+        )
+    base_doctor_model = unwrap_model(doctor_model).model
 
     # ----- SBERT (frozen) & text mappers (trainable) -----
     sbert_model, sbert_tokenizer, sbert_device, sbert_dim = init_sbert()
@@ -131,7 +237,8 @@ def main():
             device=device,
             max_triplets=args.max_corpus_triplets,
         )
-        logging.info(f"Loaded {len(retriever.records)} external triplets from {args.triplet_corpus}")
+        if is_main_process(rank):
+            logging.info(f"Loaded {len(retriever.records)} external triplets from {args.triplet_corpus}")
 
     # ----- Source-aware graph encoder -----
     graph_encoder = load_gnn_model[args.gnn_model](
@@ -148,18 +255,24 @@ def main():
         graph_encoder=graph_encoder,
         gnn_hidden_dim=args.gnn_hidden_dim,
         prefix_len=args.prefix_len,
-        hidden_size=model.config.hidden_size
+        hidden_size=base_doctor_model.config.hidden_size
     ).to(device)
+    if distributed:
+        projector = DDP(
+            projector,
+            device_ids=[local_rank] if torch.cuda.is_available() else None,
+            output_device=local_rank if torch.cuda.is_available() else None,
+        )
     latent_refiner = LatentClinicalThoughtRefiner(
-        doctor_model=model,
+        doctor_model=doctor_model,
         refinement_steps=args.refinement_steps,
     )
 
     # ----- Optimiser: graph encoder + projector + source-aware mappers + doctor LLM -----
-    optim_params = list(projector.parameters()) + list(graph_encoder.parameters()) \
+    optim_params = list(projector.parameters()) \
                    + list(node_in.parameters()) + list(edge_in.parameters()) \
-                   + list(source_in.parameters()) + list(model.parameters())
-    optimizer = torch.optim.AdamW(optim_params, lr=args.lr)
+                   + list(source_in.parameters()) + list(doctor_model.parameters())
+    optimizer = torch.optim.AdamW(optim_params, lr=args.lr, weight_decay=args.weight_decay)
     optimizer.zero_grad(set_to_none=True)
 
     all_letters = None
@@ -167,9 +280,12 @@ def main():
     run_loss = 0.0
 
     for ep in range(args.epochs):
-        random.shuffle(samples)
+        rank_samples = build_epoch_shard(samples, ep, rank, world_size, args.seed)
 
-        for sample in tqdm(samples, desc=f"Epoch {ep}"):
+        for local_step, sample in enumerate(
+            tqdm(rank_samples, desc=f"Epoch {ep}", disable=not is_main_process(rank)),
+            start=1,
+        ):
             question = sample["question"]
             patient_info = sample.get("initial_info") or get_full_context(sample)
 
@@ -210,7 +326,6 @@ def main():
 
             # ----- Token embeddings for prompt -----
             ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-            txt_emb = model.get_input_embeddings()(ids)
 
             # ----- Triplets → PyG Graph (using SBERT externally) -----
             graph_data = triplets_to_graph(
@@ -227,17 +342,18 @@ def main():
 
             # ----- Project to evidence tokens, refine latent thoughts, and concatenate -----
             evidence_tokens = projector(graph_data)  # (1, m, hidden)
-            evidence_tokens = evidence_tokens.to(dtype=txt_emb.dtype, device=txt_emb.device)
+            evidence_tokens = evidence_tokens.to(dtype=next(base_doctor_model.parameters()).dtype, device=device)
             refined_context = latent_refiner(evidence_tokens)  # (1, 2m, hidden)
             attn_mask = torch.ones(
                 1,
-                refined_context.size(1) + txt_emb.size(1),
+                refined_context.size(1) + ids.size(1),
                 dtype=torch.long,
                 device=device,
             )
 
-            out = model(
-                inputs_embeds=torch.cat([refined_context, txt_emb], dim=1),
+            out = doctor_model(
+                input_ids=ids,
+                refined_context=refined_context,
                 attention_mask=attn_mask,
                 use_cache=False,
             )
@@ -258,13 +374,14 @@ def main():
                 out.logits[:, -1, target_ids],
                 torch.tensor([target_label], device=device)
             )
-            (ce_loss / args.batch_size).backward()
+            (ce_loss / local_accum_steps).backward()
 
             global_step += 1
             run_loss += ce_loss.item()
 
-            print(f"[Step {global_step}] CE: {ce_loss.item():.4f}")
-            if args.use_wandb:
+            if is_main_process(rank):
+                print(f"[Rank {rank} | Step {global_step}] CE: {ce_loss.item():.4f}")
+            if args.use_wandb and is_main_process(rank):
                 wandb.log({
                     "ce_loss": ce_loss.item(),
                     "loss": ce_loss.item(),
@@ -272,38 +389,49 @@ def main():
                     "epoch": ep,
                 })
 
-            if global_step % args.batch_size == 0:
+            if local_step % local_accum_steps == 0:
+                sync_module_grads([node_in, edge_in, source_in], distributed, world_size)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-        if global_step % args.batch_size != 0:
+        if len(rank_samples) % local_accum_steps != 0:
+            sync_module_grads([node_in, edge_in, source_in], distributed, world_size)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
         mean_loss = run_loss / max(global_step, 1)
-        logging.info(f"Epoch {ep} complete. Mean loss: {mean_loss:.4f}")
-        if args.use_wandb:
+        if distributed:
+            loss_state = torch.tensor([run_loss, float(global_step)], dtype=torch.float64, device=device)
+            dist.all_reduce(loss_state, op=dist.ReduceOp.SUM)
+            mean_loss = (loss_state[0] / loss_state[1].clamp_min(1.0)).item()
+        if is_main_process(rank):
+            logging.info(f"Epoch {ep} complete. Mean loss: {mean_loss:.4f}")
+        if args.use_wandb and is_main_process(rank):
             wandb.log({"epoch_avg_loss": mean_loss, "epoch": ep})
 
         # ----- Save graph encoder + projector + mappers -----
-        ckpt_dir = os.path.dirname(args.save_ckpt)
-        if ckpt_dir:
-            os.makedirs(ckpt_dir, exist_ok=True)
-        ckpt = {
-            "projector": projector.state_dict(),
-            "graph_encoder": graph_encoder.state_dict(),
-            "node_in": node_in.state_dict(),
-            "edge_in": edge_in.state_dict(),
-            "source_in": source_in.state_dict(),
-            "config": vars(args),
-            "hidden_size": model.config.hidden_size,
-        }
-        torch.save(ckpt, args.save_ckpt)
+        if is_main_process(rank):
+            ckpt_dir = os.path.dirname(args.save_ckpt)
+            if ckpt_dir:
+                os.makedirs(ckpt_dir, exist_ok=True)
+            base_projector = unwrap_model(projector)
+            ckpt = {
+                "projector": base_projector.state_dict(),
+                "graph_encoder": base_projector.graph_encoder.state_dict(),
+                "node_in": unwrap_model(node_in).state_dict(),
+                "edge_in": unwrap_model(edge_in).state_dict(),
+                "source_in": unwrap_model(source_in).state_dict(),
+                "config": vars(args),
+                "hidden_size": base_doctor_model.config.hidden_size,
+            }
+            torch.save(ckpt, args.save_ckpt)
 
-    os.makedirs(args.save_doctor_dir, exist_ok=True)
-    model.save_pretrained(args.save_doctor_dir)
-    tokenizer.save_pretrained(args.save_doctor_dir)
-    print("Training finished.")
+    if is_main_process(rank):
+        os.makedirs(args.save_doctor_dir, exist_ok=True)
+        base_doctor_model.save_pretrained(args.save_doctor_dir)
+        tokenizer.save_pretrained(args.save_doctor_dir)
+        print("Training finished.")
+    cleanup_distributed(distributed)
 
 
 if __name__ == "__main__":

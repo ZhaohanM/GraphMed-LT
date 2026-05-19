@@ -21,10 +21,11 @@ from utils.triplet_retrieval import TripletRetriever
 import triplet_extraction
 
 from openai import OpenAI
-client = OpenAI(
-    base_url=os.environ.get("IDA_LLM_BASE_URL", "http://api.llm.apps.os.dcs.gla.ac.uk/v1"),
-    api_key=os.environ.get("IDA_LLM_API_KEY", "YOUR_API_KEY_HERE")
-)
+
+client_kwargs = {"api_key": os.environ.get("OPENAI_API_KEY", "")}
+if os.environ.get("OPENAI_BASE_URL"):
+    client_kwargs["base_url"] = os.environ["OPENAI_BASE_URL"]
+client = OpenAI(**client_kwargs)
 
 def setup_logger(name: str, file: Optional[str]):
     if not file:

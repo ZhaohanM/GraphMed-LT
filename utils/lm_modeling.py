@@ -1,5 +1,6 @@
 from tqdm import tqdm
 import gensim
+import os
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -97,7 +98,7 @@ def load_sbert():
     tokenizer = AutoTokenizer.from_pretrained(pretrained_repo)
 
     # data parallel
-    if torch.cuda.device_count() > 1:
+    if torch.cuda.device_count() > 1 and int(os.environ.get("WORLD_SIZE", "1")) == 1:
         print(f'Using {torch.cuda.device_count()} GPUs')
         model = nn.DataParallel(model)
 
