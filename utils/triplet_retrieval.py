@@ -8,8 +8,8 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn.functional as F
 
-from utils.graph_memory import RETRIEVED_SOURCE, TripletLike, normalize_triplet_record, triplet_to_text
-from utils.triplets_to_graph import sber_text2embedding
+from utils.graph_memory import RETRIEVED_SOURCE, normalize_triplet_record, triplet_to_text
+from utils.triplets_to_graph import bica_text2embedding
 
 
 def _load_json_or_jsonl(path: str) -> List[Dict[str, str]]:
@@ -85,36 +85,36 @@ def load_triplet_corpus(path: str, max_triplets: Optional[int] = None) -> List[D
 
 
 class TripletRetriever:
-    """
-    Similarity retriever for the external triplet corpus used by the triplet agent.
-
-    The paper instantiates the corpus with PrimeKG. This class expects a local
-    PrimeKG-derived triplet file and does not fabricate any background triples.
-    """
+    """BiCA similarity retriever for a local PrimeKG-derived triplet corpus."""
 
     def __init__(
         self,
         corpus_path: str,
         *,
-        sbert_model,
-        sbert_tokenizer,
-        sbert_device,
+        encoder_model=None,
+        encoder_tokenizer=None,
+        encoder_device=None,
+        sbert_model=None,
+        sbert_tokenizer=None,
+        sbert_device=None,
         device: torch.device,
         max_triplets: Optional[int] = None,
     ) -> None:
         self.records = load_triplet_corpus(corpus_path, max_triplets=max_triplets)
         self.device = device
-        self.sbert_model = sbert_model
-        self.sbert_tokenizer = sbert_tokenizer
-        self.sbert_device = sbert_device
+        self.encoder_model = encoder_model if encoder_model is not None else sbert_model
+        self.encoder_tokenizer = encoder_tokenizer if encoder_tokenizer is not None else sbert_tokenizer
+        self.encoder_device = encoder_device if encoder_device is not None else sbert_device
+        if self.encoder_model is None or self.encoder_device is None:
+            raise ValueError("A BiCA encoder model and device are required")
 
         if self.records:
             texts = [triplet_to_text(record, include_source=False) for record in self.records]
             with torch.no_grad():
-                self.embeddings = sber_text2embedding(
-                    self.sbert_model,
-                    self.sbert_tokenizer,
-                    self.sbert_device,
+                self.embeddings = bica_text2embedding(
+                    self.encoder_model,
+                    self.encoder_tokenizer,
+                    self.encoder_device,
                     texts,
                 ).to(self.device)
                 self.embeddings = F.normalize(self.embeddings, p=2, dim=-1)
@@ -126,10 +126,10 @@ class TripletRetriever:
         if not query or not self.records or top_k <= 0:
             return []
 
-        query_embedding = sber_text2embedding(
-            self.sbert_model,
-            self.sbert_tokenizer,
-            self.sbert_device,
+        query_embedding = bica_text2embedding(
+            self.encoder_model,
+            self.encoder_tokenizer,
+            self.encoder_device,
             [query],
         ).to(self.device)
         query_embedding = F.normalize(query_embedding, p=2, dim=-1)
@@ -138,4 +138,3 @@ class TripletRetriever:
         k = min(top_k, scores.shape[-1])
         top_indices = torch.topk(scores.squeeze(0), k=k).indices.tolist()
         return [dict(self.records[idx], source=RETRIEVED_SOURCE) for idx in top_indices]
-

@@ -11,12 +11,6 @@ def _call_model(messages: List[Dict[str, str]], **kwargs):
     use_vllm = kwargs.pop("use_vllm", False)
     use_api = kwargs.pop("use_api", None)
 
-    # Embedding-level graph tokens cannot be sent through a text API call. Local
-    # GraphMed-LT training uses them directly; these prompt helpers keep a text
-    # fallback for benchmark agents.
-    kwargs.pop("triplet_prefix", None)
-    kwargs.pop("prefix_len", None)
-
     return helper.get_response(
         messages,
         model_name,

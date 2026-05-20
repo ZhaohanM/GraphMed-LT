@@ -13,7 +13,7 @@ from patient import Patient
 # === projection stack (matches the training code) ===
 from utils.triplet_projector import TripletProjector
 from utils.gnn import load_gnn_model
-from utils.triplets_to_graph import init_sbert, make_text_mappers, triplets_to_graph
+from utils.triplets_to_graph import init_bica, make_text_mappers, triplets_to_graph
 from utils.graph_memory import PatientGraphMemory
 from utils.triplet_retrieval import TripletRetriever
 
@@ -86,11 +86,10 @@ class TripletProjectionEngine:
         self.gnn_layers = int(cfg.get("gnn_layers", 2))
         self.gat_heads = int(cfg.get("gat_heads", 4))
 
-        # SBERT encoder (frozen) and text mappers (trainable; weights will be loaded)
-        self.sbert_model, self.sbert_tokenizer, self.sbert_device, self.sbert_dim = init_sbert()
-        # mappers map SBERT embeddings to GNN input dim
+        # BiCA encoder (frozen) and text mappers (trainable; weights will be loaded)
+        self.bica_model, self.bica_tokenizer, self.bica_device, self.bica_dim = init_bica()
         self.node_in, self.edge_in, self.source_in = make_text_mappers(
-            sbert_dim=self.sbert_dim,
+            embedding_dim=self.bica_dim,
             gnn_in_dim=self.gnn_in_dim,
             device=self.device,
             include_source=True,
@@ -138,9 +137,9 @@ class TripletProjectionEngine:
 
         graph_data = triplets_to_graph(
             triplets=triplets,
-            sbert_model=self.sbert_model,
-            sbert_tokenizer=self.sbert_tokenizer,
-            sbert_device=self.sbert_device,
+            encoder_model=self.bica_model,
+            encoder_tokenizer=self.bica_tokenizer,
+            encoder_device=self.bica_device,
             node_in=self.node_in,
             edge_in=self.edge_in,
             source_in=self.source_in,
@@ -197,16 +196,16 @@ def main():
             torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         )
         if projection_engine is not None:
-            sbert_model = projection_engine.sbert_model
-            sbert_tokenizer = projection_engine.sbert_tokenizer
-            sbert_device = projection_engine.sbert_device
+            bica_model = projection_engine.bica_model
+            bica_tokenizer = projection_engine.bica_tokenizer
+            bica_device = projection_engine.bica_device
         else:
-            sbert_model, sbert_tokenizer, sbert_device, _ = init_sbert()
+            bica_model, bica_tokenizer, bica_device, _ = init_bica()
         retriever = TripletRetriever(
             _args.triplet_corpus,
-            sbert_model=sbert_model,
-            sbert_tokenizer=sbert_tokenizer,
-            sbert_device=sbert_device,
+            encoder_model=bica_model,
+            encoder_tokenizer=bica_tokenizer,
+            encoder_device=bica_device,
             device=device,
             max_triplets=getattr(_args, "max_corpus_triplets", None),
         )
@@ -295,8 +294,8 @@ def run_patient_interaction(
     Multi-turn conversation loop. Each turn we extract / update triplets and,
     if a projection_engine is provided, compute graph-conditioned evidence tokens
     from the source-aware graph memory. The tensor is attached to
-    patient_state["triplet_prefix"] for local expert implementations that can
-    consume embedding-level context.
+    patient_state["triplet_prefix"] so local expert implementations can
+    refine and consume embedding-level context.
     """
     # 0) Build Expert & Patient
     expert_system = expert_class(args, sample["question"], sample["options"])

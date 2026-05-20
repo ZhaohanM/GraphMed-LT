@@ -44,19 +44,15 @@ python projection_train.py \
   --epochs 5
 ```
 
-The code expects the external triplet corpus to be provided locally and does not include PrimeKG triples in this repository.
+The code expects the external triplet corpus to be provided locally and does not include PrimeKG triples in this repository. The BiCA encoder defaults to `bisectgroup/BiCA-base` and can be changed with `GRAPHMED_BICA_MODEL`.
 
-For multi-GPU or multi-node training on a Slurm cluster:
-
-```bash
-sbatch -N 2 scripts/isambard/submit_projection_train_ddp.slurm
-```
 
 ## Benchmark
 
 ```bash
 python GraphMedLT_benchmark.py \
   --expert_module expert --expert_class ScaleExpert \
+  --expert_model save_model/doctor_agent \
   --patient_module patient --patient_class FactSelectPatient \
   --data_dir data --dev_filename all_dev_good.jsonl \
   --projection_ckpt save_model/graphmed_lt.ckpt \

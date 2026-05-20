@@ -17,7 +17,7 @@ from utils.graph_memory import PatientGraphMemory
 from utils.triplet_retrieval import TripletRetriever
 from triplet_extraction import extract_triplets
 from utils.gnn import load_gnn_model
-from utils.triplets_to_graph import init_sbert, make_text_mappers, triplets_to_graph
+from utils.triplets_to_graph import init_bica, make_text_mappers, triplets_to_graph
 import helper
 import wandb
 
@@ -218,10 +218,10 @@ def main():
         )
     base_doctor_model = unwrap_model(doctor_model).model
 
-    # ----- SBERT (frozen) & text mappers (trainable) -----
-    sbert_model, sbert_tokenizer, sbert_device, sbert_dim = init_sbert()
+    # ----- BiCA (frozen) & text mappers (trainable) -----
+    bica_model, bica_tokenizer, bica_device, bica_dim = init_bica()
     node_in, edge_in, source_in = make_text_mappers(
-        sbert_dim=sbert_dim,
+        embedding_dim=bica_dim,
         gnn_in_dim=args.gnn_in_dim,
         device=device,
         include_source=True,
@@ -231,9 +231,9 @@ def main():
     if args.triplet_corpus:
         retriever = TripletRetriever(
             args.triplet_corpus,
-            sbert_model=sbert_model,
-            sbert_tokenizer=sbert_tokenizer,
-            sbert_device=sbert_device,
+            encoder_model=bica_model,
+            encoder_tokenizer=bica_tokenizer,
+            encoder_device=bica_device,
             device=device,
             max_triplets=args.max_corpus_triplets,
         )
@@ -327,17 +327,17 @@ def main():
             # ----- Token embeddings for prompt -----
             ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
 
-            # ----- Triplets → PyG Graph (using SBERT externally) -----
+            # ----- Triplets to source-aware PyG graph (using BiCA externally) -----
             graph_data = triplets_to_graph(
                 triplets=graph_triplets,
-                sbert_model=sbert_model,
-                sbert_tokenizer=sbert_tokenizer,
-                sbert_device=sbert_device,
+                encoder_model=bica_model,
+                encoder_tokenizer=bica_tokenizer,
+                encoder_device=bica_device,
                 node_in=node_in,
                 edge_in=edge_in,
                 source_in=source_in,
                 gnn_in_dim=args.gnn_in_dim,
-                device=txt_emb.device,
+                device=device,
             )
 
             # ----- Project to evidence tokens, refine latent thoughts, and concatenate -----
