@@ -169,6 +169,8 @@ class DoctorAgentWrapper(torch.nn.Module):
 
 def build_epoch_shard(samples: List[Dict], epoch: int, rank: int, world_size: int, seed: int) -> List[Dict]:
     epoch_samples = list(samples)
+    if not epoch_samples:
+        return []
     random.Random(seed + epoch).shuffle(epoch_samples)
 
     if world_size == 1:
@@ -176,8 +178,9 @@ def build_epoch_shard(samples: List[Dict], epoch: int, rank: int, world_size: in
 
     per_rank = math.ceil(len(epoch_samples) / world_size)
     target_len = per_rank * world_size
-    if len(epoch_samples) < target_len:
-        epoch_samples.extend(epoch_samples[: target_len - len(epoch_samples)])
+    original_len = len(epoch_samples)
+    while len(epoch_samples) < target_len:
+        epoch_samples.append(epoch_samples[(len(epoch_samples) - original_len) % original_len])
     return epoch_samples[rank:target_len:world_size]
 
 
