@@ -7,9 +7,28 @@ import argparse
 import os
 import math
 from typing import List, Dict
+from functools import partial
 from tqdm import tqdm
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+try:
+    from torch.distributed.fsdp import (
+        FullyShardedDataParallel as FSDP,
+        FullStateDictConfig,
+        MixedPrecision,
+        ShardingStrategy,
+        StateDictType,
+    )
+    from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
+except ImportError:  # pragma: no cover - older torch builds
+    FSDP = None
+    FullStateDictConfig = None
+    MixedPrecision = None
+    ShardingStrategy = None
+    StateDictType = None
+    size_based_auto_wrap_policy = None
+    transformer_auto_wrap_policy = None
 
 from utils.triplet_projector import TripletProjector
 from utils.latent_refinement import LatentClinicalThoughtRefiner
@@ -51,8 +70,79 @@ def is_main_process(rank: int) -> bool:
     return rank == 0
 
 
+def is_fsdp_model(module) -> bool:
+    return FSDP is not None and isinstance(module, FSDP)
+
+
 def unwrap_model(module):
-    return module.module if isinstance(module, DDP) else module
+    if isinstance(module, DDP):
+        return module.module
+    if is_fsdp_model(module):
+        return module.module
+    return module
+
+
+def get_fsdp_auto_wrap_policy(model: torch.nn.Module):
+    layer_names = set(getattr(model, "_no_split_modules", []) or [])
+    layer_classes = {m.__class__ for m in model.modules() if m.__class__.__name__ in layer_names}
+    if layer_classes:
+        return partial(transformer_auto_wrap_policy, transformer_layer_cls=layer_classes)
+    return partial(size_based_auto_wrap_policy, min_num_params=100_000_000)
+
+
+def wrap_distributed_doctor(
+    doctor_model: torch.nn.Module,
+    raw_doctor_model: torch.nn.Module,
+    *,
+    distributed: bool,
+    backend: str,
+    local_rank: int,
+):
+    if not distributed:
+        return doctor_model
+    if backend == "fsdp":
+        if FSDP is None:
+            raise RuntimeError("PyTorch FSDP is not available in this environment.")
+        fsdp_kwargs = {
+            "auto_wrap_policy": get_fsdp_auto_wrap_policy(raw_doctor_model),
+            "sharding_strategy": ShardingStrategy.FULL_SHARD,
+            "use_orig_params": True,
+            "limit_all_gathers": True,
+        }
+        if torch.cuda.is_available():
+            fsdp_kwargs["device_id"] = torch.cuda.current_device()
+            fsdp_kwargs["mixed_precision"] = MixedPrecision(
+                param_dtype=torch.float16,
+                reduce_dtype=torch.float16,
+                buffer_dtype=torch.float16,
+            )
+        return FSDP(doctor_model, **fsdp_kwargs)
+    return DDP(
+        doctor_model,
+        device_ids=[local_rank] if torch.cuda.is_available() else None,
+        output_device=local_rank if torch.cuda.is_available() else None,
+    )
+
+
+def save_doctor_model(doctor_model, tokenizer, save_dir: str, rank: int, distributed: bool):
+    if is_fsdp_model(doctor_model):
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(doctor_model, StateDictType.FULL_STATE_DICT, cfg):
+            state_dict = doctor_model.state_dict()
+        if is_main_process(rank):
+            os.makedirs(save_dir, exist_ok=True)
+            state_dict = {
+                (k[len("model."):] if k.startswith("model.") else k): v
+                for k, v in state_dict.items()
+            }
+            doctor_model.module.model.save_pretrained(save_dir, state_dict=state_dict)
+            tokenizer.save_pretrained(save_dir)
+    elif is_main_process(rank):
+        os.makedirs(save_dir, exist_ok=True)
+        unwrap_model(doctor_model).model.save_pretrained(save_dir)
+        tokenizer.save_pretrained(save_dir)
+    if distributed:
+        dist.barrier()
 
 
 class DoctorAgentWrapper(torch.nn.Module):
@@ -154,6 +244,9 @@ def main():
     parser.add_argument("--train_file", default="data/all_train_convo.jsonl")
     parser.add_argument("--expert_model", default="Qwen/Qwen2.5-72B-Instruct")
     parser.add_argument("--triplet_model", default="Qwen/Qwen2.5-72B-Instruct")
+    parser.add_argument("--distributed_backend", choices=["ddp", "fsdp"], default="fsdp")
+    parser.add_argument("--triplet_use_api", action="store_true", help="Use an OpenAI-compatible API for the frozen triplet agent")
+    parser.add_argument("--triplet_use_vllm", action="store_true", help="Use the local vLLM-compatible path for the frozen triplet agent")
 
     parser.add_argument("--prefix_len", type=int, default=20)
     parser.add_argument("--refinement_steps", type=int, default=5)
@@ -180,6 +273,10 @@ def main():
 
     args = parser.parse_args()
     distributed, rank, world_size, local_rank = setup_distributed()
+    if args.distributed_backend == "fsdp" and distributed and FSDP is None:
+        raise RuntimeError("--distributed_backend fsdp was requested, but FSDP is unavailable.")
+    if args.triplet_use_api and not (os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_BASE_URL")):
+        raise RuntimeError("--triplet_use_api requires OPENAI_API_KEY or OPENAI_BASE_URL to be set.")
     random.seed(args.seed + rank)
     torch.manual_seed(args.seed + rank)
     if torch.cuda.is_available():
@@ -200,23 +297,27 @@ def main():
         )
 
     # ----- Doctor LLM (full fine-tuning) -----
-    cache = helper.ModelCache(args.expert_model, max_tokens=512)
-    tokenizer = cache.tokenizer
     train_device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    raw_doctor_model = cache.model.to(train_device).train()
-    device = next(raw_doctor_model.parameters()).device
+    load_device = "cpu" if distributed and args.distributed_backend == "fsdp" else train_device
+    cache = helper.ModelCache(args.expert_model, max_tokens=512, device=load_device)
+    tokenizer = cache.tokenizer
+    raw_doctor_model = cache.model.train()
+    if not (distributed and args.distributed_backend == "fsdp"):
+        raw_doctor_model = raw_doctor_model.to(train_device)
+    device = train_device
     if args.gradient_checkpointing and hasattr(raw_doctor_model, "gradient_checkpointing_enable"):
         raw_doctor_model.gradient_checkpointing_enable()
     for p in raw_doctor_model.parameters():
         p.requires_grad_(True)
     doctor_model = DoctorAgentWrapper(raw_doctor_model)
-    if distributed:
-        doctor_model = DDP(
-            doctor_model,
-            device_ids=[local_rank] if torch.cuda.is_available() else None,
-            output_device=local_rank if torch.cuda.is_available() else None,
-        )
-    base_doctor_model = unwrap_model(doctor_model).model
+    doctor_model = wrap_distributed_doctor(
+        doctor_model,
+        raw_doctor_model,
+        distributed=distributed,
+        backend=args.distributed_backend,
+        local_rank=local_rank,
+    )
+    hidden_size = raw_doctor_model.config.hidden_size
 
     # ----- BiCA (frozen) & text mappers (trainable) -----
     bica_model, bica_tokenizer, bica_device, bica_dim = init_bica()
@@ -255,7 +356,7 @@ def main():
         graph_encoder=graph_encoder,
         gnn_hidden_dim=args.gnn_hidden_dim,
         prefix_len=args.prefix_len,
-        hidden_size=base_doctor_model.config.hidden_size
+        hidden_size=hidden_size
     ).to(device)
     if distributed:
         projector = DDP(
@@ -296,8 +397,9 @@ def main():
                 qa_pairs=[],
                 model_args={
                     "model_name": args.triplet_model,
-                    "use_api": True,
-                    "client": client,
+                    "use_api": args.triplet_use_api,
+                    "use_vllm": args.triplet_use_vllm,
+                    "client": client if args.triplet_use_api else None,
                     "debug": False
                 },
                 choices=sample.get("options", None)
@@ -342,7 +444,7 @@ def main():
 
             # ----- Project to evidence tokens, refine latent thoughts, and concatenate -----
             evidence_tokens = projector(graph_data)  # (1, m, hidden)
-            evidence_tokens = evidence_tokens.to(dtype=next(base_doctor_model.parameters()).dtype, device=device)
+            evidence_tokens = evidence_tokens.to(dtype=next(doctor_model.parameters()).dtype, device=device)
             refined_context = latent_refiner(evidence_tokens)  # (1, 2m, hidden)
             attn_mask = torch.ones(
                 1,
@@ -422,14 +524,12 @@ def main():
                 "edge_in": unwrap_model(edge_in).state_dict(),
                 "source_in": unwrap_model(source_in).state_dict(),
                 "config": vars(args),
-                "hidden_size": base_doctor_model.config.hidden_size,
+                "hidden_size": hidden_size,
             }
             torch.save(ckpt, args.save_ckpt)
 
+    save_doctor_model(doctor_model, tokenizer, args.save_doctor_dir, rank, distributed)
     if is_main_process(rank):
-        os.makedirs(args.save_doctor_dir, exist_ok=True)
-        base_doctor_model.save_pretrained(args.save_doctor_dir)
-        tokenizer.save_pretrained(args.save_doctor_dir)
         print("Training finished.")
     cleanup_distributed(distributed)
 

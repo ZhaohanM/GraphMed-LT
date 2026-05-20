@@ -24,7 +24,7 @@ class Patient:
         
         self.model_name = args.patient_model
         self.history = []  # To track the interaction history of questions and answers
-        self.facts = sample['atomic_facts'] if 'atomic_facts' in sample else None  # To store atomic facts after initial processing, you can choose to store this somewhere locally to avoid repeated processing
+        self.facts = sample.get('atomic_facts') or sample.get('facts')  # Use provided facts when available to avoid repeated decomposition
 
         self.max_length = 50  # Maximum length of the response (different from the expert system)
         self.use_vllm = args.use_vllm  

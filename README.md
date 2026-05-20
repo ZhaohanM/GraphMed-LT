@@ -30,6 +30,7 @@ python projection_train.py \
   --train_file data/all_train_convo.jsonl \
   --expert_model Qwen/Qwen2.5-72B-Instruct \
   --triplet_model Qwen/Qwen2.5-72B-Instruct \
+  --distributed_backend fsdp \
   --triplet_corpus path/to/primekg_triplets.jsonl \
   --retrieval_top_k 3 \
   --prefix_len 20 \

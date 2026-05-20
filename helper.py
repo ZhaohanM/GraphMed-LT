@@ -35,8 +35,9 @@ class ModelCache:
         self.tokenizer = None
         self.terminators = None
         self.client = None
+        requested_device = kwargs.pop("device", None)
         self.args = kwargs
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(requested_device) if requested_device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.load_model_and_tokenizer()
 
     def load_model_and_tokenizer(self):
@@ -110,15 +111,20 @@ class ModelCache:
 
     def huggingface_generate(self, messages):
         inputs = self._input_ids_from_messages(messages)
-        outputs = self.model.generate(
-            inputs,
-            do_sample=True,
-            max_new_tokens=int(self.max_tokens),
-            temperature=self.temperature,
-            top_p=self.top_p,
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.terminators,
-        )
+        generation_kwargs = {
+            "max_new_tokens": int(self.max_tokens),
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.terminators,
+        }
+        if self.temperature is None or float(self.temperature) <= 0:
+            generation_kwargs["do_sample"] = False
+        else:
+            generation_kwargs.update({
+                "do_sample": True,
+                "temperature": float(self.temperature),
+                "top_p": self.top_p,
+            })
+        outputs = self.model.generate(inputs, **generation_kwargs)
         response_text = self.tokenizer.decode(outputs[0][inputs.shape[-1]:], skip_special_tokens=True).strip()
         usage = {"input_tokens": inputs.shape[-1], "output_tokens": outputs.shape[-1] - inputs.shape[-1]}
         output_dict = {"response_text": response_text, "usage": usage}
@@ -256,7 +262,9 @@ class ModelCache:
 
 
 def get_response(messages, model_name, use_vllm=False, use_api=None, **kwargs):
-    if "gpt" in model_name or "o1" in model_name:
+    lower_name = str(model_name).lower()
+    openai_prefixes = ("gpt-", "o1", "o3", "o4", "chatgpt")
+    if use_api is None and lower_name.startswith(openai_prefixes):
         use_api = "openai"
 
     init_kwargs = {k: v for k, v in kwargs.items() if k != "triplet_prefix"}
