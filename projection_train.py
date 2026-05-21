@@ -90,6 +90,14 @@ def get_fsdp_auto_wrap_policy(model: torch.nn.Module):
     return partial(size_based_auto_wrap_policy, min_num_params=100_000_000)
 
 
+def get_fsdp_sharding_strategy(model: torch.nn.Module) -> ShardingStrategy:
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    trainable_sizes = [p.numel() for p in model.parameters() if p.requires_grad]
+    if trainable_sizes and min(trainable_sizes) < world_size:
+        return ShardingStrategy.NO_SHARD
+    return ShardingStrategy.FULL_SHARD
+
+
 def wrap_distributed_doctor(
     doctor_model: torch.nn.Module,
     raw_doctor_model: torch.nn.Module,
@@ -105,7 +113,7 @@ def wrap_distributed_doctor(
             raise RuntimeError("PyTorch FSDP is not available in this environment.")
         fsdp_kwargs = {
             "auto_wrap_policy": get_fsdp_auto_wrap_policy(raw_doctor_model),
-            "sharding_strategy": ShardingStrategy.FULL_SHARD,
+            "sharding_strategy": get_fsdp_sharding_strategy(raw_doctor_model),
             "use_orig_params": True,
             "limit_all_gathers": True,
         }
